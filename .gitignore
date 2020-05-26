@@ -1,3 +1,11 @@
 
 *.swp
 __pycache__/
+modelnet40v2png/
+ModelNet40_20/
+ModelNet40_20_ori4/
+modelnet40v2png.tar
+modelnet40v2png_ori4.tar
+modelnet40v2png_ori4/
+rotationnet_checkpoint.pth.tar
+rotationnet_model_best.pth.tar
