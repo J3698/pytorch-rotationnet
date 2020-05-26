@@ -10,12 +10,14 @@ import torch.nn.functional
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import numpy as np
+from model import FineTuneModel
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -53,7 +55,7 @@ parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--world-size', default=1, type=int,
                     help='number of distributed processes')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
@@ -64,59 +66,8 @@ best_prec1 = 0
 vcand = np.load('vcand_case2.npy')
 nview = 20
 
-class FineTuneModel(nn.Module):
-    def __init__(self, original_model, arch, num_classes):
-        super(FineTuneModel, self).__init__()
-
-        if arch.startswith('alexnet') :
-            self.features = original_model.features
-            self.classifier = nn.Sequential(
-                nn.Dropout(),
-                nn.Linear(256 * 6 * 6, 4096),
-                nn.ReLU(inplace=True),
-                nn.Dropout(),
-                nn.Linear(4096, 4096),
-                nn.ReLU(inplace=True),
-                nn.Linear(4096, num_classes),
-            )
-            self.modelName = 'alexnet'
-        elif arch.startswith('resnet') :
-            # Everything except the last linear layer
-            self.features = nn.Sequential(*list(original_model.children())[:-1])
-            self.classifier = nn.Sequential(
-                nn.Linear(512, num_classes)
-            )
-            self.modelName = 'resnet'
-        elif arch.startswith('vgg16'):
-            self.features = original_model.features
-            self.classifier = nn.Sequential(
-                nn.Dropout(),
-                nn.Linear(25088, 4096),
-                nn.ReLU(inplace=True),
-                nn.Dropout(),
-                nn.Linear(4096, 4096),
-                nn.ReLU(inplace=True),
-                nn.Linear(4096, num_classes),
-            )
-            self.modelName = 'vgg16'
-        else :
-            raise("Finetuning not supported on this architecture yet")
-
-        # # Freeze those weights
-        # for p in self.features.parameters():
-        #     p.requires_grad = False
 
 
-    def forward(self, x):
-        f = self.features(x)
-        if self.modelName == 'alexnet' :
-            f = f.view(f.size(0), 256 * 6 * 6)
-        elif self.modelName == 'vgg16':
-            f = f.view(f.size(0), -1)
-        elif self.modelName == 'resnet' :
-            f = f.view(f.size(0), -1)
-        y = self.classifier(f)
-        return y
 
 
 def main():
@@ -133,7 +84,7 @@ def main():
         nview = 160
 
     if args.batch_size % nview != 0:
-        print 'Error: batch size should be multiplication of the number of views,', nview
+        print('Error: batch size should be multiplication of the number of views,', nview)
         exit()
 
     if args.distributed:
@@ -175,6 +126,8 @@ def main():
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode = 'max', factor = 0.1, verbose = True, threshold = 0.001)
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -184,6 +137,7 @@ def main():
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -200,7 +154,6 @@ def main():
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-#            transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -231,11 +184,11 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+    stop_count = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        adjust_learning_rate(optimizer, epoch)
 
         # random permutation
         inds = np.zeros( ( nview, train_nsamp ) ).astype('int')
@@ -248,12 +201,17 @@ def main():
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch)
+        for param_group in optimizer.param_groups:
+            print('Learning Rate: {lr:.6f}'.format(lr=param_group['lr']))
 
         # evaluate on validation set
         prec1 = validate(val_loader, model, criterion)
+        is_best = prec1 > best_prec1
+
+        # step scheduler
+        scheduler.step(prec1)
 
         # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
         fname='rotationnet_checkpoint.pth.tar'
         fname2='rotationnet_model_best.pth.tar'
@@ -266,9 +224,19 @@ def main():
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
             'optimizer' : optimizer.state_dict(),
+            'scheduler' : scheduler.state_dict()
         }, is_best,fname,fname2)
 
-            
+        # determine early stopping
+        if not is_best:
+            stop_count += 1
+            if stop_count == 15:
+                print("Early stopping after 15 epochs without improvement")
+                return
+        else:
+            stop_count = 0    
+                
+ 
 
 def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
@@ -283,36 +251,56 @@ def train(train_loader, model, criterion, optimizer, epoch):
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
         nsamp = int( input.size(0) / nview )
+        n_imgs = input.size(0)
+        print("nsamp", nsamp)
+        print("n_imgs", n_imgs)
+        print("inp", input.shape)
+        print("target", target.shape)
+
+        assert target.shape == (n_imgs,)
 
         # measure data loading time
         data_time.update(time.time() - end)
 
-        input_var = torch.autograd.Variable(input)
-        target_ = torch.LongTensor( target.size(0) * nview )
+        input_var = input
+        target_ = torch.LongTensor(n_imgs * nview)
 
         # compute output
         output = model(input_var)
         num_classes = int( output.size( 1 ) / nview ) - 1
+        print("n_classes", num_classes)
         output = output.view( -1, num_classes + 1 )
+        assert output.shape == (n_imgs * nview, num_classes + 1)
 
         ###########################################
         # compute scores and decide target labels #
         ###########################################
-        output_ = torch.nn.functional.log_softmax( output )
+        output_ = torch.nn.functional.log_softmax(output, dim = -1)
+        assert output_.shape == (n_imgs * nview, num_classes + 1)
         # divide object scores by the scores for "incorrect view label" (see Eq.(5))
-        output_ = output_[ :, :-1 ] - torch.t( output_[ :, -1 ].repeat( 1, output_.size(1)-1 ).view( output_.size(1)-1, -1 ) )
+        class_scores = output_[ :, :-1 ]
+        assert class_scores.shape == (n_imgs * nview, num_classes)
+        icorr_view_scores = output_[ :, -1 ].repeat( 1, output_.size(1)-1 )
+        assert icorr_view_scores.shape == (1, num_classes * (n_imgs * nview))
+        icorr_view_scores = torch.t( icorr_view_scores.view( output_.size(1)-1, -1 ))
+        assert icorr_view_scores.shape == (n_imgs * nview, num_classes)
+        output_ = class_scores - icorr_view_scores 
+        assert output_.shape == (n_imgs * nview, num_classes)
         # reshape output matrix
         output_ = output_.view( -1, nview * nview, num_classes )
+        assert output_.shape == (nsamp, nview * nview, num_classes)
         output_ = output_.data.cpu().numpy()
         output_ = output_.transpose( 1, 2, 0 )
+        assert output_.shape == (nview * nview, num_classes, nsamp)
+
         # initialize target labels with "incorrect view label"
-        for j in range(target_.size(0)):
-            target_[ j ] = num_classes
+        target_[:] = num_classes
+
         # compute scores for all the candidate poses (see Eq.(5))
         scores = np.zeros( ( vcand.shape[ 0 ], num_classes, nsamp ) )
         for j in range(vcand.shape[0]):
-            for k in range(vcand.shape[1]):
-                scores[ j ] = scores[ j ] + output_[ vcand[ j ][ k ] * nview + k ]
+            scores[j] = sum(output_[ vcand[ j ][ k ] * nview + k ] for k in range(vcand.shape[1]))
+
         # for each sample #n, determine the best pose that maximizes the score for the target class (see Eq.(2))
         for n in range( nsamp ):
             j_max = np.argmax( scores[ :, target[ n * nview ], n ] )
@@ -326,7 +314,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # compute loss
         loss = criterion(output, target_var)
-        losses.update(loss.data[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -357,42 +345,43 @@ def validate(val_loader, model, criterion):
 
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+        with torch.no_grad():
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input)
+            target_var = torch.autograd.Variable(target)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+            # compute output
+            output = model(input_var)
+            loss = criterion(output, target_var)
 
-        # log_softmax and reshape output
-        num_classes = int( output.size( 1 ) / nview ) - 1
-        output = output.view( -1, num_classes + 1 )
-        output = torch.nn.functional.log_softmax( output )
-        output = output[ :, :-1 ] - torch.t( output[ :, -1 ].repeat( 1, output.size(1)-1 ).view( output.size(1)-1, -1 ) )
-        output = output.view( -1, nview * nview, num_classes )
+            # log_softmax and reshape output
+            num_classes = int( output.size( 1 ) / nview ) - 1
+            output = output.view( -1, num_classes + 1 )
+            output = torch.nn.functional.log_softmax( output )
+            output = output[ :, :-1 ] - torch.t( output[ :, -1 ].repeat( 1, output.size(1)-1 ).view( output.size(1)-1, -1 ) )
+            output = output.view( -1, nview * nview, num_classes )
 
-        # measure accuracy and record loss
-        prec1, prec5 = my_accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0)/nview)
-        top5.update(prec5[0], input.size(0)/nview)
+            # measure accuracy and record loss
+            prec1, prec5 = my_accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0)/nview)
+            top5.update(prec5.item(), input.size(0)/nview)
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-        if i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5))
+            if i % args.print_freq == 0:
+                print('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                       i, len(val_loader), batch_time=batch_time, loss=losses,
+                       top1=top1, top5=top5))
 
-    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+    precision_string = ' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+    print(precision_string.format(top1=top1, top5=top5))
 
     return top1.avg
 
@@ -421,12 +410,6 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 200 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 200))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-        print ('Learning Rate: {lr:.6f}'.format(lr=param_group['lr']))
 
 
 def accuracy(output, target, topk=(1,)):
