@@ -252,10 +252,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
     for i, (input, target) in enumerate(train_loader):
         nsamp = int( input.size(0) / nview )
         n_imgs = input.size(0)
-        print("nsamp", nsamp)
-        print("n_imgs", n_imgs)
-        print("inp", input.shape)
-        print("target", target.shape)
+        # print("nsamp", nsamp)
+        # print("n_imgs", n_imgs)
+        # print("inp", input.shape)
+        # print("target", target.shape)
 
         assert target.shape == (n_imgs,)
 
@@ -268,7 +268,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute output
         output = model(input_var)
         num_classes = int( output.size( 1 ) / nview ) - 1
-        print("n_classes", num_classes)
+        # print("n_classes", num_classes)
         output = output.view( -1, num_classes + 1 )
         assert output.shape == (n_imgs * nview, num_classes + 1)
 
